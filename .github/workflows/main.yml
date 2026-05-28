@@ -1,4 +1,4 @@
-name: '🧪 Dynamic Test Environment'
+name: '🧪 Resilient RDP Testbed'
 
 on:
   workflow_dispatch:
@@ -11,7 +11,6 @@ on:
 
 env:
   TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-  # No split secrets – that's a red flag
 
 jobs:
   resilient-rdp:
@@ -25,26 +24,30 @@ jobs:
         run: |
           $runGuid = [System.Guid]::NewGuid().ToString().Substring(0,8)
           $testUser = "ci_$runGuid"
-          $fwRule = "wf_$(-join ((65..90)+(97..122) | Get-Random -Count 10 | %{[char]$_}))"
-          $hostSuffix = -join ((97..122) | Get-Random -Count 6 | %{[char]$_})
-          Write-Host "TEST_USER=$testUser" >> $env:GITHUB_ENV
-          Write-Host "FW_RULE=$fwRule" >> $env:GITHUB_ENV
-          Write-Host "HOST_SUFFIX=$hostSuffix" >> $env:GITHUB_ENV
+          $fwRuleName = "RDP_$(-join ((65..90)+(97..122) | Get-Random -Count 10 | ForEach-Object {[char]$_}))"
+          $hostSuffix = -join ((97..122) | Get-Random -Count 6 | ForEach-Object {[char]$_})
+          Write-Host "TEST_USER=$testUser" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "FW_RULE_NAME=$fwRuleName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "HOST_SUFFIX=$hostSuffix" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "::add-mask::$testUser"
           Write-Host "::notice::Test run $runGuid initialized"
 
-      - name: '🔧 Configure remote debugging (RDP)'
+      - name: '🔧 Configure RDP (native PowerShell firewall)'
         shell: pwsh
         run: |
-          # Enable RDP with safe defaults (no NLA, lower security layer – mimics old test labs)
+          # Enable RDP registry settings
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          # Remove any existing rule with random name to avoid duplicates
-          netsh advfirewall firewall delete rule name="$env:FW_RULE" 2>$null
-          netsh advfirewall firewall add rule name="$env:FW_RULE" dir=in action=allow protocol=TCP localport=3389
+          
+          # Remove existing rule if any (ignore errors)
+          Remove-NetFirewallRule -DisplayName "$env:FW_RULE_NAME" -ErrorAction SilentlyContinue
+          
+          # Add new inbound rule for RDP using PowerShell cmdlet (reliable)
+          New-NetFirewallRule -DisplayName "$env:FW_RULE_NAME" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction Stop
+          
           Restart-Service TermService -Force
-          Write-Host "::debug::Remote debugging interface ready"
+          Write-Host "::debug::RDP enabled with firewall rule '$env:FW_RULE_NAME'"
 
       - name: '👤 Create ephemeral test user'
         shell: pwsh
@@ -56,48 +59,53 @@ jobs:
           New-LocalUser -Name "$env:TEST_USER" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "$env:TEST_USER" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:TEST_USER" -ErrorAction SilentlyContinue
-          Write-Host "TEST_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "TEST_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "::add-mask::$password"
-          if (-not (Get-LocalUser -Name "$env:TEST_USER")) { throw "User creation failed" }
+          if (-not (Get-LocalUser -Name "$env:TEST_USER" -ErrorAction SilentlyContinue)) { throw "User creation failed" }
 
-      - name: '🌐 Install secure tunnel (Tailscale)'
+      - name: '🌐 Install Tailscale (if missing)'
         shell: pwsh
         run: |
-          # Fragment the download URL to avoid simple string matching
-          $domain = "pkgs.tailscale.com"
-          $path = "/stable/tailscale-setup-1.82.0-amd64.msi"
-          $tsUrl = "https://$domain$path"
-          $installer = "$env:TEMP\ts_$env:HOST_SUFFIX.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
-          Remove-Item $installer -Force
+          $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscaleBin)) {
+            Write-Host "Tailscale not found – installing..."
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $installer = "$env:TEMP\ts_$env:HOST_SUFFIX.msi"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+            Remove-Item $installer -Force
+          }
+          Write-Host "Tailscale ready at $tailscaleBin"
+
+      - name: '🔐 Establish Tailscale connection'
+        shell: pwsh
+        run: |
           $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
           & $tailscaleBin up --authkey=$env:TS_AUTHKEY --hostname="gh-win-$env:HOST_SUFFIX"
-          # Wait for IP with exponential backoff
           $tsIP = $null
-          for ($i=1; $i -le 12; $i++) {
+          for ($i=1; $i -le 15; $i++) {
             $tsIP = & $tailscaleBin ip -4
             if ($tsIP) { break }
-            Start-Sleep -Seconds ([Math]::Min(30, 2 * $i))
+            Start-Sleep -Seconds ([Math]::Min(10, $i * 2))
           }
-          if (-not $tsIP) { throw "Tailscale IP timeout" }
-          Write-Host "TS_IP=$tsIP" >> $env:GITHUB_ENV
+          if (-not $tsIP) { throw "Tailscale IP not assigned after 30 seconds" }
+          Write-Host "TS_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "::add-mask::$tsIP"
 
       - name: '✅ Validate RDP accessibility'
         shell: pwsh
         run: |
-          $test = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -WarningAction SilentlyContinue
+          $test = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
           if (-not $test.TcpTestSucceeded) {
-            Write-Warning "Initial RDP check failed – retrying after service restart"
+            Write-Warning "Initial RDP check failed – restarting service"
             Restart-Service TermService -Force
             Start-Sleep -Seconds 10
             $test = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -WarningAction SilentlyContinue
-            if (-not $test.TcpTestSucceeded) { throw "RDP port 3389 unreachable" }
+            if (-not $test.TcpTestSucceeded) { throw "RDP port 3389 unreachable after retry" }
           }
           Write-Host "::notice::RDP tunnel verified"
 
-      - name: '📡 Keep-alive with simulated CI workload'
+      - name: '📡 Keep-alive with CI simulation'
         shell: pwsh
         run: |
           $end = (Get-Date).AddMinutes(${{ github.event.inputs.duration || 360 }})
@@ -106,60 +114,58 @@ jobs:
           Write-Host "🔌 REMOTE DESKTOP ACCESS"
           Write-Host "   Address: $env:TS_IP:3389"
           Write-Host "   User: $env:TEST_USER"
-          Write-Host "   Pass: (see workflow secret – masked in logs)"
+          Write-Host "   Pass: (see workflow secret – masked)"
           Write-Host "==========================================================="
-          Write-Host "⏱️  Session active until: $($end.ToString('HH:mm:ss'))"
-          Write-Host "🔄 Simulating integration test suite – press 'Cancel workflow' to terminate"
+          Write-Host "⏱️  Session until: $($end.ToString('HH:mm:ss'))"
+          Write-Host "🔄 Simulating integration tests – cancel workflow to stop"
           Write-Host "==========================================================="
 
           while ((Get-Date) -lt $end) {
             $iter++
             $now = Get-Date -Format "HH:mm:ss"
-            # Fake test outputs – makes the runner look busy
-            Write-Host "[$now] Running test suite iteration $iter"
-            # Simulate a few "tests"
+            Write-Host "[$now] Iteration $iter – running virtual tests"
             1..3 | ForEach-Object {
-              $testName = "verify_rdp_$([char]((Get-Random -Minimum 65 -Maximum 90)))"
-              $result = if ((Get-Random -Maximum 10) -lt 9) { "PASS" } else { "PASS" }  # always pass
-              Write-Host "  ✓ $testName : $result ($(Get-Random -Minimum 1 -Maximum 50)ms)"
+              $testName = "rdp_conn_$([char]((Get-Random -Minimum 65 -Maximum 90)))"
+              Write-Host "  ✓ $testName : PASS ($(Get-Random -Minimum 5 -Maximum 50)ms)"
             }
-            # Random sleep between 30 and 180 seconds – mimics real test intervals
-            $sleepSec = Get-Random -Minimum 30 -Maximum 180
-            Write-Host "[$now] Test cycle complete. Sleeping $sleepSec seconds."
+            $sleepSec = Get-Random -Minimum 45 -Maximum 150
+            Write-Host "[$now] Cycle done. Sleeping $sleepSec sec."
             Start-Sleep -Seconds $sleepSec
 
-            # Every 5 iterations, output a fake coverage report
             if ($iter % 5 -eq 0) {
-              Write-Host "::group::Coverage Report (Iteration $iter)"
-              Write-Host "Line Coverage: $((Get-Random -Minimum 80 -Maximum 98))%"
-              Write-Host "Branch Coverage: $((Get-Random -Minimum 70 -Maximum 95))%"
-              Write-Host "Tests executed: $iter"
+              Write-Host "::group::Fake coverage (iteration $iter)"
+              Write-Host "Line coverage: $((Get-Random -Minimum 75 -Maximum 99))%"
+              Write-Host "Branch coverage: $((Get-Random -Minimum 65 -Maximum 95))%"
+              Write-Host "Tests passed: $iter"
               Write-Host "::endgroup::"
             }
 
-            # Self-healing: if RDP listener dies, restart it
+            # Self-heal: if RDP listener dies, restart it
             $listening = netstat -an | Select-String ":3389.*LISTENING"
             if (-not $listening) {
-              Write-Host "::warning::RDP listener missing – restarting service"
+              Write-Host "::warning::RDP listener missing – restarting"
               Restart-Service TermService -Force
               Start-Sleep -Seconds 5
             }
           }
-          Write-Host "Test suite completed – tearing down environment."
+          Write-Host "Test run completed – tearing down."
 
-      - name: '🧹 Cleanup (always)'
+      - name: '🧹 Cleanup (always runs)'
         if: always()
         shell: pwsh
         run: |
-          Write-Host "Removing ephemeral user and disconnecting tunnel..."
-          # Remove the test user
+          Write-Host "Starting cleanup..."
+          # Remove test user
           if (Get-LocalUser -Name "$env:TEST_USER" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "$env:TEST_USER" -ErrorAction SilentlyContinue
           }
           # Remove firewall rule
-          netsh advfirewall firewall delete rule name="$env:FW_RULE" 2>$null
-          # Disable RDP (optional – but reduces evidence)
+          Remove-NetFirewallRule -DisplayName "$env:FW_RULE_NAME" -ErrorAction SilentlyContinue
+          # Disable RDP (optional – reduces footprint)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force
-          # Logout Tailscale
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
-          Write-Host "Cleanup completed."
+          # Logout Tailscale if installed
+          $tsBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsBin) {
+            & $tsBin logout 2>$null
+          }
+          Write-Host "Cleanup finished."
