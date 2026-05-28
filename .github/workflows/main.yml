@@ -1,229 +1,151 @@
-# Fixed GitHub Actions Workflow
-
-```yaml
-name: '🧪 Resilient RDP Testbed'
+name: RDP Testbed
 
 on:
   workflow_dispatch:
     inputs:
       duration:
-        description: 'Runtime (minutes)'
+        description: Runtime in minutes
         required: false
-        default: '360'
-        type: number
+        default: "360"
 
 env:
   TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
 jobs:
-  resilient-rdp:
+  rdp:
     runs-on: windows-latest
-    timeout-minutes: ${{ fromJSON(github.event.inputs.duration || '360') }}
+    timeout-minutes: 360
 
     steps:
-      - name: '🌀 Generate ephemeral identities'
+      - name: Generate session info
         shell: pwsh
         run: |
-          $runGuid = [System.Guid]::NewGuid().ToString().Substring(0,8)
-          $testUser = "ci_$runGuid"
-          $fwRuleName = "RDP_$(-join ((65..90)+(97..122) | Get-Random -Count 10 | ForEach-Object {[char]$_}))"
-          $hostSuffix = -join ((97..122) | Get-Random -Count 6 | ForEach-Object {[char]$_})
+          $id = [guid]::NewGuid().ToString().Substring(0,6)
 
-          "TEST_USER=$testUser" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "FW_RULE_NAME=$fwRuleName" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "HOST_SUFFIX=$hostSuffix" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TEST_USER=ci_$id" | Out-File $env:GITHUB_ENV -Append
+          "HOSTNAME=gh-$id" | Out-File $env:GITHUB_ENV -Append
 
-          Write-Host "::add-mask::$testUser"
-          Write-Host "::notice::Test run $runGuid initialized"
-
-      - name: '🔧 Configure remote debugging (RDP)'
+      - name: Enable RDP
         shell: pwsh
         run: |
-          Write-Host "Enabling RDP..."
-
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-
-          # Disable NLA
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
-
-          # Set security layer
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0
-
-          # Enable firewall group instead of custom rule
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-
-          # Ensure service is running
-          Set-Service -Name TermService -StartupType Automatic
-          Restart-Service -Name TermService -Force
-
-          Start-Sleep -Seconds 5
-
-          Write-Host "RDP configured successfully"
-
-      - name: '👤 Create ephemeral test user'
-        shell: pwsh
-        run: |
-          $special = [char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)
-
-          $pwdChars = \
-            (65..90 | Get-Random -Count 4) + \
-            (97..122 | Get-Random -Count 4) + \
-            (48..57 | Get-Random -Count 4) + \
-            ($special | Get-Random -Count 4)
-
-          $password = -join ($pwdChars | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          if (-not (Get-LocalUser -Name "$env:TEST_USER" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "$env:TEST_USER" -Password $securePass -AccountNeverExpires
-          }
-
-          Add-LocalGroupMember -Group 'Administrators' -Member "$env:TEST_USER" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member "$env:TEST_USER" -ErrorAction SilentlyContinue
-
-          "TEST_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "::add-mask::$password"
-          Write-Host "Temporary user created"
-
-      - name: '🌐 Install Tailscale'
-        shell: pwsh
-        run: |
-          $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tailscaleBin)) {
-            Write-Host "Installing Tailscale..."
-
-            $installer = "$env:TEMP\tailscale.msi"
-
-            Invoke-WebRequest `
-              -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-              -OutFile $installer
-
-            Start-Process msiexec.exe `
-              -ArgumentList "/i `"$installer`" /qn /norestart" `
-              -Wait
-
-            Start-Sleep -Seconds 15
-          }
-
-          if (-not (Test-Path $tailscaleBin)) {
-            throw 'Tailscale installation failed'
-          }
-
-          Write-Host "Tailscale installed successfully"
-
-      - name: '🔐 Connect Tailscale'
-        shell: pwsh
-        run: |
-          $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $tailscaleBin up `
-            --authkey=$env:TS_AUTHKEY `
-            --hostname="gh-win-$env:HOST_SUFFIX" `
-            --accept-routes
-
-          Start-Sleep -Seconds 10
-
-          $tsIP = & $tailscaleBin ip -4
-
-          if (-not $tsIP) {
-            throw 'Failed to get Tailscale IP'
-          }
-
-          "TS_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "::notice::Tailscale IP: $tsIP"
-
-      - name: '✅ Validate RDP accessibility'
-        shell: pwsh
-        run: |
-          Write-Host "Testing RDP port..."
-
-          $result = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
-
-          if (-not $result.TcpTestSucceeded) {
-            throw 'RDP validation failed'
-          }
-
-          Write-Host "RDP reachable"
-
-      - name: '📡 Keep alive'
-        shell: pwsh
-        run: |
-          $duration = [int]('${{ github.event.inputs.duration || '360' }}')
-          $end = (Get-Date).AddMinutes($duration)
-
-          Write-Host ''
-          Write-Host '========================================='
-          Write-Host 'RDP READY'
-          Write-Host "IP: $env:TS_IP"
-          Write-Host "USER: $env:TEST_USER"
-          Write-Host 'PASSWORD: stored in TEST_PASSWORD env'
-          Write-Host '========================================='
-
-          while ((Get-Date) -lt $end) {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session alive"
-
-            $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-
-            if (-not $listening) {
-              Write-Host 'Restarting RDP service...'
-              Restart-Service TermService -Force
-            }
-
-            Start-Sleep -Seconds 60
-          }
-
-      - name: '🧹 Cleanup'
-        if: always()
-        shell: pwsh
-        run: |
-          Write-Host 'Cleaning up...'
-
-          # Remove temporary user
-          if (Get-LocalUser -Name "$env:TEST_USER" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "$env:TEST_USER"
-          }
-
-          # Disable RDP
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
-            -Value 1
+            -Value 0
 
-          # Logout Tailscale safely
-          $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0
 
-          if (Test-Path $tailscaleBin) {
-            & $tailscaleBin logout
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+
+          Write-Host "RDP enabled"
+
+      - name: Create user
+        shell: pwsh
+        run: |
+          $password = "Pass123!!$((Get-Random -Minimum 1000 -Maximum 9999))"
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name $env:TEST_USER `
+            -Password $secure `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $env:TEST_USER
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:TEST_USER
+
+          "TEST_PASSWORD=$password" | Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "::notice::USER: $env:TEST_USER"
+          Write-Host "::notice::PASS: $password"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$env:TEMP\tailscale.msi"
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /qn" `
+            -Wait
+
+          Start-Sleep 15
+
+      - name: Connect Tailscale
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up `
+            --authkey=$env:TS_AUTHKEY `
+            --hostname=$env:HOSTNAME `
+            --accept-routes
+
+          Start-Sleep 10
+
+          $ip = & $ts ip -4
+
+          if (-not $ip) {
+            throw "No Tailscale IP"
           }
 
-          Write-Host 'Cleanup completed'
-```
+          "TS_IP=$ip" | Out-File $env:GITHUB_ENV -Append
 
-## What Was Fixed
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "RDP READY"
+          Write-Host "IP: $ip"
+          Write-Host "USER: $env:TEST_USER"
+          Write-Host "PASS: $env:TEST_PASSWORD"
+          Write-Host "================================"
 
-* Replaced broken `Remove-NetFirewallRule` logic causing:
-  `No rules match the specified criteria`
+      - name: Validate RDP
+        shell: pwsh
+        run: |
+          $test = Test-NetConnection `
+            -ComputerName $env:TS_IP `
+            -Port 3389
 
-* Replaced custom firewall rule creation with:
-  `Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'`
+          if (-not $test.TcpTestSucceeded) {
+            throw "RDP failed"
+          }
 
-* Fixed Tailscale cleanup crash:
-  `tailscale.exe is not recognized`
+          Write-Host "RDP OK"
 
-* Added validation after Tailscale install.
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          $end = (Get-Date).AddMinutes(360)
 
-* Added proper service startup for `TermService`.
+          while ((Get-Date) -lt $end) {
+            Write-Host "Alive: $(Get-Date)"
+            Start-Sleep 60
+          }
 
-* Fixed YAML expression parsing issues.
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-LocalUser -Name $env:TEST_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:TEST_USER
+          }
 
-* Improved installation reliability with extra wait time.
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-* Simplified RDP validation logic.
+          if (Test-Path $ts) {
+            & $ts logout
+          }
 
-* Prevented workflow from failing during cleanup.
-
-Use this as your full `.github/workflows/rdp.yml` file.
+          Write-Host "Cleanup done"
